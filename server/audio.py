@@ -53,13 +53,17 @@ def to_listening_wav(src: Path, dst: Path) -> Path:
 
 
 def to_wav(src: Path, dst: Path, *, preset: str = config.DEFAULT_PRESET,
-           denoise: bool = True) -> Path:
-    """src(webm/mp3/m4a/wav/…) → dst(16kHz mono pcm_s16le wav)."""
+           denoise: bool = True, start_sec: float = 0.0) -> Path:
+    """src(webm/mp3/m4a/wav/…) → dst(16kHz mono pcm_s16le wav).
+
+    start_sec > 0 이면 그 지점부터만 만든다 — 이어서 변환할 때 앞부분을 다시 처리하지 않으려고.
+    """
     p = config.PRESETS.get(preset, config.PRESETS[config.DEFAULT_PRESET])
     chain = p["chain"] if denoise else "loudnorm=I=-16:TP=-1.5:LRA=11"
+    seek = ["-ss", f"{start_sec:.3f}"] if start_sec > 0 else []
     cmd = [
         FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-        "-i", str(src.resolve()),
+        *seek, "-i", str(src.resolve()),
         "-af", chain,
         "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
         str(dst.resolve()),
@@ -71,4 +75,18 @@ def to_wav(src: Path, dst: Path, *, preset: str = config.DEFAULT_PRESET,
         raise AudioError(
             f"ffmpeg 전처리 실패 (code {proc.returncode}): {proc.stderr.strip()[:500]}"
         )
+    return dst
+
+
+def pcm_to_wav(pcm: Path, dst: Path, sample_rate: int = 16000) -> Path:
+    """실시간 녹음 중 디스크에 이어 붙인 raw PCM(16bit 모노)을 WAV 로 감싼다.
+
+    녹음 도중 서버가 꺼져도 그때까지의 소리는 .pcm 파일에 남아 있어서 되살릴 수 있다.
+    """
+    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+           "-f", "s16le", "-ar", str(sample_rate), "-ac", "1", "-i", str(pcm.resolve()),
+           "-c:a", "pcm_s16le", str(dst.resolve())]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or not dst.exists():
+        raise AudioError(f"녹음 복구 실패: {proc.stderr.strip()[:300]}")
     return dst

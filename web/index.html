@@ -184,6 +184,13 @@
   }
   .toast.show{opacity:1}
   .err{color:var(--rec); font-size:13px; margin-top:8px}
+  .banner{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:12px;
+    padding:10px 12px; border-radius:10px; border:1px solid #5a4520; background:rgba(255,176,32,.08);
+    color:var(--warn); font-size:13px}
+  .banner span{flex:1; min-width:200px}
+  .conv-warn{font-size:12px; color:var(--dim); margin-top:6px}
+  .hist-item .m.warn{color:var(--warn)}
+  .draft-note{font-size:12px; color:var(--dim); margin:8px 0 2px; padding-left:8px}
   .hidden{display:none !important}
 </style>
 </head>
@@ -245,6 +252,10 @@
         <span id="stageLabel">대기 중</span>
         <span id="pctLabel">0%</span>
       </div>
+      <div class="conv-warn">
+        ⚠ 변환이 끝날 때까지 <b>검은 서버 창을 닫지 마세요.</b>
+        닫혀도 저장된 곳까지는 남고, 기록에서 <b>이어서 변환</b>할 수 있습니다. 브라우저 탭은 닫아도 됩니다.
+      </div>
     </div>
     <div class="err hidden" id="errBox"></div>
   </div>
@@ -261,6 +272,10 @@
       <button class="sm" data-fmt="txt">txt</button>
       <button class="sm" data-fmt="srt">srt</button>
       <button class="sm" data-fmt="md">md</button>
+    </div>
+    <div class="banner hidden" id="jobBanner">
+      <span id="jobBannerText"></span>
+      <button class="sm primary" id="resumeBtn">이어서 변환</button>
     </div>
     <div class="tabs">
       <div class="tab on" data-view="seg">타임스탬프</div>
@@ -379,7 +394,21 @@ const S = {
   preset: "standard",    // "standard" | "lecture"  (서버 config.PRESETS)
   liveWs: null, workletNode: null, srcNode: null,
   drafts: [], finalizing: false, clearedDrafts: false,
+  eta: { t0: null, p0: 0 },   // 남은 시간 추정용 (이번 실행의 첫 진행률과 시각)
 };
+
+const STATUS_LABEL = {
+  recording: "녹음 중", queued: "변환 대기", running: "변환 중",
+  interrupted: "중단됨", error: "오류",
+};
+const savedPct = (r) => r.duration_sec
+  ? Math.min(99, Math.round((r.progress_sec || 0) / r.duration_sec * 100)) : 0;
+function fmtDur(sec) {
+  sec = Math.max(0, Math.round(sec));
+  if (sec < 60) return "1분 미만";
+  const h = Math.floor(sec / 3600), m = Math.round((sec % 3600) / 60);
+  return h ? `${h}시간 ${m}분` : `${m}분`;
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // 마이크 원본 PCM 을 뽑아내는 AudioWorklet.
@@ -813,6 +842,7 @@ async function submit(file, title) {
 
 function openSocket(jobId) {
   if (S.ws) { try { S.ws.close(); } catch (_) {} }
+  S.eta = { t0: null, p0: 0 };
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}/ws/progress/${jobId}`);
   S.ws = ws;
@@ -828,11 +858,22 @@ function openSocket(jobId) {
         S.segments = [];
         S.clearedDrafts = true;
       }
+      // 진행 중인 기록을 열면 이미 그려진 구간이 다시 올 수 있다 — 시간이 앞서면 건너뜀
+      const last = S.segments[S.segments.length - 1];
+      if (last && m.end <= last.end) return;
       S.segments.push(m);
       appendSeg(m);
     } else if (m.type === "progress") {
       $("progBar").style.width = m.percent + "%";
-      $("pctLabel").textContent = Math.round(m.percent) + "%";
+      const now = Date.now();
+      let label = Math.round(m.percent) + "%";
+      if (S.eta.t0 === null) {
+        S.eta = { t0: now, p0: m.percent };
+      } else if (m.percent - S.eta.p0 >= 1) {
+        const rate = (m.percent - S.eta.p0) / ((now - S.eta.t0) / 1000);   // %/초
+        label += ` · 남은 시간 약 ${fmtDur((100 - m.percent) / rate)}`;
+      }
+      $("pctLabel").textContent = label;
     } else if (m.type === "done") {
       S.segments = m.segments;
       setEditable(true);
@@ -867,6 +908,7 @@ function showError(msg) {
 function resetResult() {
   mainSaver.flush();   // 다른 기록으로 넘어가기 전에 이전 수정 저장 (대상 id 는 저장기가 기억)
   setEditable(false);
+  $("jobBanner").classList.add("hidden");
   S.segments = []; $("segs").innerHTML = ""; $("plain").value = "";
   S.drafts = []; S.finalizing = false; S.clearedDrafts = false;
   $("progBar").style.width = "0"; $("pctLabel").textContent = "0%";
@@ -1120,10 +1162,19 @@ async function loadHistory() {
   list.forEach((r) => {
     const d = document.createElement("div");
     d.className = "hist-item";
-    const state = r.status === "done" ? "" : ` · ${r.status}`;
-    d.innerHTML =
-      `<div class="t">${r.title}</div>` +
-      `<div class="m">${fmtTime(r.duration_sec)} · ${r.created_at.replace("T", " ").slice(5)}${state}</div>`;
+    let state = "";
+    if (r.status !== "done") {
+      state = " · " + (STATUS_LABEL[r.status] || r.status);
+      const pct = savedPct(r);
+      if ((r.status === "interrupted" || r.status === "running") && pct) state += ` ${pct}%`;
+    }
+    const t = document.createElement("div");
+    t.className = "t";
+    t.textContent = r.title;
+    const m = document.createElement("div");
+    m.className = "m" + (r.status === "interrupted" || r.status === "error" ? " warn" : "");
+    m.textContent = `${fmtTime(r.duration_sec)} · ${r.created_at.replace("T", " ").slice(5)}${state}`;
+    d.append(t, m);
     const x = document.createElement("div");
     x.className = "x"; x.textContent = "✕";
     x.onclick = async (e) => {
@@ -1144,7 +1195,9 @@ async function openTranscript(id) {
   S.segments = rec.segments || [];
   setEditable(rec.status === "done");
   renderSegs();
-  $("plain").value = rec.text || "";
+  renderSavedDrafts(rec.drafts || []);
+  $("plain").value = rec.text || S.segments.map((s) => s.text).join(" ");
+  showJobBanner(rec);
   $("resultTitle").textContent = rec.title;
   $("resultCard").classList.remove("hidden");
   $("playCard").classList.remove("hidden");
@@ -1160,7 +1213,78 @@ async function openTranscript(id) {
     loadWaveformFromBlob(blob);
   } catch (_) { S.peaks = null; drawWave(0); }
 
+  // 지금 이 서버에서 변환 중인 기록이면 진행 상황을 이어서 보여준다
+  if (rec.status === "running" || rec.status === "queued") {
+    $("progWrap").classList.remove("hidden");
+    $("stageLabel").textContent = STATUS_LABEL[rec.status];
+    openSocket(id);
+  }
+
   window.scrollTo({ top: 0, behavior: "smooth" });
+}
+
+// 정밀 변환이 아직 덮지 못한 뒷부분의 실시간 초안 (서버가 저장해둔 것)
+function renderSavedDrafts(drafts) {
+  if (!drafts.length) return;
+  const box = $("segs");
+  const note = document.createElement("div");
+  note.className = "draft-note";
+  note.textContent = "↓ 아래는 녹음하면서 뜬 초안입니다 (정밀 변환 전 · 이어서 변환하면 교체됩니다)";
+  box.appendChild(note);
+  drafts.forEach((m) => {
+    const d = document.createElement("div");
+    d.className = "seg draft";
+    const ts = document.createElement("span");
+    ts.className = "ts";
+    ts.textContent = fmtTime(m.start);
+    ts.onclick = () => seek(m.start);
+    const tx = document.createElement("div");
+    tx.className = "tx";
+    tx.textContent = m.text;
+    d.append(ts, tx);
+    box.appendChild(d);
+  });
+}
+
+function showJobBanner(rec) {
+  const b = $("jobBanner");
+  const canResume = rec.status === "interrupted" || rec.status === "error";
+  if (!canResume && rec.status !== "recording") { b.classList.add("hidden"); return; }
+  const pct = savedPct(rec);
+  let msg = rec.status === "recording"
+    ? "지금 녹음 중인 기록입니다."
+    : (rec.error || "변환이 멈췄습니다.");
+  if (canResume) {
+    msg += pct ? ` (정밀 변환 ${pct}%까지 저장됨 — 거기서부터 이어서 합니다)` : " (처음부터 변환합니다)";
+    if (rec.duration_sec) msg += ` · 녹음 ${fmtDur(rec.duration_sec)}`;
+  }
+  $("jobBannerText").textContent = msg;
+  $("resumeBtn").classList.toggle("hidden", !canResume);
+  $("resumeBtn").disabled = false;
+  $("resumeBtn").onclick = () => resumeJob(rec.id);
+  b.classList.remove("hidden");
+}
+
+async function resumeJob(id) {
+  $("resumeBtn").disabled = true;
+  let res;
+  try {
+    const r = await fetch(`/api/transcripts/${id}/resume`, { method: "POST" });
+    res = await r.json();
+    if (!r.ok) throw new Error(res.detail || r.status);
+  } catch (e) {
+    $("resumeBtn").disabled = false;
+    return toast("이어서 변환 실패: " + e.message);
+  }
+  $("jobBanner").classList.add("hidden");
+  renderSegs();            // 초안은 정밀 결과로 바뀔 예정이라 치우고, 저장된 결과 뒤에 이어 붙인다
+  S.finalizing = false;
+  $("errBox").classList.add("hidden");
+  $("playCard").classList.remove("hidden");
+  $("progWrap").classList.remove("hidden");
+  $("stageLabel").textContent = `이어서 변환 준비 중 (${res.model})`;
+  openSocket(id);
+  loadHistory();
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1564,9 +1688,11 @@ $("rvSaveEval").onclick = async () => {
   toast(`평가 폴더에 저장: ${res.audio} + ${res.txt}`);
 };
 
-window.addEventListener("beforeunload", () => {
+window.addEventListener("beforeunload", (e) => {
   mainSaver.flushOnUnload();
   reviewSaver.flushOnUnload();
+  // 녹음 중이면 한 번 묻는다 (실시간 모드는 그때까지 저장되지만, 정확도 우선 모드는 녹음이 사라짐)
+  if (isRecording()) { e.preventDefault(); e.returnValue = ""; }
 });
 
 // ─────────────────────────────────────────────────────────────────────

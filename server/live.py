@@ -41,8 +41,13 @@ _VAD = VadOptions(
 class LiveSession:
     """녹음 1회분의 상태. WebSocket 연결 하나당 하나."""
 
-    def __init__(self, *, live_gain: bool = False) -> None:
+    def __init__(self, *, live_gain: bool = False, pcm_path: Path | None = None) -> None:
         self.live_gain = live_gain
+        # 받은 소리를 디스크에도 바로 이어 붙인다. 메모리에만 두면 녹음 도중
+        # 서버가 꺼지거나 탭이 닫힐 때 그때까지의 녹음이 통째로 사라진다.
+        self.pcm_path = pcm_path
+        self._pcm_file = open(pcm_path, "ab") if pcm_path else None
+        self._unflushed = 0
         self.gain = 1.0          # 마지막으로 적용한 배율 (UI 표시용)
         self.pcm = bytearray()   # 전체 녹음 (int16 PCM). 종료 후 정밀 변환에 그대로 쓴다
         self.cursor = 0          # 샘플 인덱스 — 여기까지는 이미 초안 처리 완료
@@ -52,6 +57,17 @@ class LiveSession:
     # ── 입력 ─────────────────────────────────────────────────────────
     def feed(self, data: bytes) -> None:
         self.pcm.extend(data)
+        if self._pcm_file:
+            self._pcm_file.write(data)
+            self._unflushed += len(data)
+            if self._unflushed >= SR * 2:        # 약 1초 분량마다 OS 로 넘긴다
+                self._pcm_file.flush()
+                self._unflushed = 0
+
+    def close_file(self) -> None:
+        if self._pcm_file:
+            self._pcm_file.close()
+            self._pcm_file = None
 
     @property
     def total_samples(self) -> int:

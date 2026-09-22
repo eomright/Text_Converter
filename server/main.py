@@ -6,11 +6,13 @@ import json
 import math
 import shutil
 import threading
+import time
 import traceback
 import urllib.parse
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 
@@ -68,11 +70,53 @@ def _warmup() -> None:
         print(f"[FAIL] 실시간 모델 로드 실패: {e}")
 
 
+def _salvage_recording(rec: dict) -> None:
+    """녹음 도중 서버가 꺼진 기록: 디스크에 쌓아둔 .pcm 을 WAV 로 되살린다."""
+    pcm = config.UPLOAD_DIR / f"{rec['id']}.pcm"
+    wav = Path(rec["audio_path"])
+    try:
+        if pcm.exists() and pcm.stat().st_size >= live.SR:   # 0.5초 이상
+            audio.pcm_to_wav(pcm, wav)
+            pcm.unlink(missing_ok=True)
+        if not wav.exists():
+            db.set_status(rec["id"], "error", "녹음 파일을 되살리지 못했습니다.")
+            return
+        db.set_recorded(rec["id"], title=None, duration_sec=audio.probe_duration(wav),
+                        status="interrupted",
+                        error="녹음 도중 서버가 꺼졌습니다. 그때까지의 녹음은 저장됐고, 이어서 변환할 수 있습니다.")
+    except Exception as e:
+        traceback.print_exc()
+        db.set_status(rec["id"], "error", f"녹음 복구 실패: {e}")
+
+
+def _recover_on_start() -> list[dict]:
+    """지난번 서버가 꺼질 때 하던 작업을 '중단됨'으로 정리한다 (변환은 저장된 곳까지 남아 있음)."""
+    rows = db.mark_interrupted()
+    for rec in rows:
+        if rec["status"] == "recording":
+            _salvage_recording(rec)
+    # 끊긴 작업이 남긴 전처리 임시 파일 (강의 하나에 100MB 넘게 남는다)
+    for pattern in ("*.16k.wav", "*.compare.wav"):
+        for f in config.UPLOAD_DIR.glob(pattern):
+            f.unlink(missing_ok=True)
+    return rows
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init()
     if not audio.ffmpeg_available():
         print("[WARN] ffmpeg 를 PATH 에서 찾지 못했습니다. 전처리가 실패합니다.")
+    stopped = _recover_on_start()
+    if stopped:
+        print(f"[INFO] 지난번에 끊긴 작업 {len(stopped)}개를 '중단됨'으로 표시했습니다.")
+        if config.AUTO_RESUME_ON_START:
+            loop = asyncio.get_running_loop()
+            for rec in stopped:
+                try:
+                    _resume(db.get(rec["id"]), loop)
+                except Exception as e:
+                    print(f"[WARN] 자동 이어서 변환 실패 {rec['id']}: {e}")
     # 모델 로딩(수십 초)이 서버 기동을 막지 않도록 백그라운드 스레드에서 예열
     threading.Thread(target=_warmup, daemon=True).start()
     print(f"[READY] http://{config.HOST}:{config.PORT}  (모델 예열 중)")
@@ -86,18 +130,30 @@ app = FastAPI(title="한국어 받아쓰기", lifespan=lifespan)
 def _run_job(job_id: str, src: Path, loop: asyncio.AbstractEventLoop,
              denoise: bool, prompt_override: str | None,
              preset: str = config.DEFAULT_PRESET) -> None:
-    """워커 스레드에서 실행. UI 갱신은 loop.call_soon_threadsafe 로 넘긴다."""
+    """워커 스레드에서 실행. UI 갱신은 loop.call_soon_threadsafe 로 넘긴다.
+
+    몇 문장마다 결과를 DB 에 저장하고(progress_sec), 다시 실행되면 거기서부터 이어간다.
+    50~80분 강의는 변환에 1~2시간 걸려서, 끝날 때 한 번만 저장하면 도중에 꺼질 때 전부 사라진다.
+    """
     state = JOBS[job_id]
 
     def push(msg: dict) -> None:
         loop.call_soon_threadsafe(state.emit, msg)
 
+    rec = db.get(job_id)
+    offset = float(rec.get("progress_sec") or 0.0)
+    prior = [s for s in rec["segments"] if s["end"] <= offset + 0.01] if offset > 0 else []
+    elapsed_before = float(rec.get("elapsed_sec") or 0.0) if offset > 0 else 0.0
+    total = float(rec.get("duration_sec") or 0.0) or audio.probe_duration(src)
+    state.segments = list(prior)
+
     wav = src.with_suffix(".16k.wav")
     try:
         db.set_status(job_id, "running")
-        push({"type": "status", "status": "running", "stage": "전처리"})
+        resume_note = f" — {int(offset // 60)}분 {int(offset % 60)}초부터 이어서" if offset > 0 else ""
+        push({"type": "status", "status": "running", "stage": "전처리" + resume_note})
 
-        audio.to_wav(src, wav, preset=preset, denoise=denoise)
+        audio.to_wav(src, wav, preset=preset, denoise=denoise, start_sec=offset)
         vad_threshold = config.PRESETS[preset]["vad_threshold"]
         model_name = config.PRESETS[preset].get("model") or transcriber.model_name
         if model_name not in transcriber.loaded_names():
@@ -109,35 +165,51 @@ def _run_job(job_id: str, src: Path, loop: asyncio.AbstractEventLoop,
         replacements = glossary["replacements"]
 
         push({"type": "status", "status": "running",
-              "stage": f"변환 ({model_name})"})
+              "stage": f"변환 ({model_name}){resume_note}"})
+
+        saved = list(prior)          # 중간 저장용 (정리된 문장)
+        progress = offset            # 여기(초)까지 처리함 — 걸러진 문장도 진행으로 친다
+        last_save, unsaved = time.time(), 0
 
         def on_segment(seg: dict, pct: float) -> None:
+            nonlocal progress, last_save, unsaved
+            seg = {**seg, "start": round(seg["start"] + offset, 2),
+                   "end": round(seg["end"] + offset, 2)}
+            progress = seg["end"]
             cleaned = postprocess.clean_segment(seg["text"], replacements)
-            if not cleaned:
-                return
-            item = {**seg, "text": cleaned}
-            state.segments.append(item)
-            push({"type": "segment", **item})
-            push({"type": "progress", "percent": round(pct, 1)})
+            if cleaned:
+                item = {**seg, "text": cleaned}
+                state.segments.append(item)
+                saved.append(item)
+                push({"type": "segment", **item})
+            push({"type": "progress",
+                  "percent": round(min(99.0, progress / total * 100) if total else pct, 1)})
+            unsaved += 1
+            if unsaved >= config.SAVE_EVERY_SEGMENTS or time.time() - last_save >= config.SAVE_EVERY_SEC:
+                db.save_partial(job_id, saved, progress)
+                last_save, unsaved = time.time(), 0
 
-        raw, duration, elapsed = transcriber.transcribe(
+        raw, _, elapsed = transcriber.transcribe(
             wav, initial_prompt=prompt, vad_threshold=vad_threshold,
             model_name=model_name,
             on_segment=on_segment
         )
+        shifted = [{**s, "start": round(s["start"] + offset, 2),
+                    "end": round(s["end"] + offset, 2)} for s in raw]
 
         # 스트리밍 중에는 세그먼트 단위로만 정리했으니, 끝나고 전체 맥락으로 한 번 더
-        final = postprocess.clean_transcript(raw, replacements)
+        final = postprocess.clean_transcript(prior + shifted, replacements)
         text = postprocess.to_paragraphs(final)
-        db.finish(job_id, final, text, elapsed)
+        elapsed_total = elapsed_before + elapsed
+        db.finish(job_id, final, text, elapsed_total)
 
         push({
             "type": "done",
             "segments": final,
             "text": text,
-            "duration_sec": round(duration, 1),
-            "elapsed_sec": round(elapsed, 1),
-            "speed": round(duration / elapsed, 2) if elapsed > 0 else 0,
+            "duration_sec": round(total, 1),
+            "elapsed_sec": round(elapsed_total, 1),
+            "speed": round(total / elapsed_total, 2) if elapsed_total > 0 else 0,
         })
     except Exception as e:
         traceback.print_exc()
@@ -148,16 +220,57 @@ def _run_job(job_id: str, src: Path, loop: asyncio.AbstractEventLoop,
 
 
 # ── API ───────────────────────────────────────────────────────────────
+def _model_for(preset: str) -> str:
+    return config.PRESETS[preset].get("model") or transcriber.model_name
+
+
+def _enqueue(job_id: str, src: Path, loop: asyncio.AbstractEventLoop,
+             denoise: bool = True, prompt: str | None = None,
+             preset: str = config.DEFAULT_PRESET) -> None:
+    JOBS[job_id] = JobState()
+    db.set_status(job_id, "queued")
+    EXECUTOR.submit(_run_job, job_id, src, loop, denoise, prompt, preset)
+
+
 def _start_job(job_id: str, src: Path, title: str, denoise: bool,
                prompt: str | None, loop: asyncio.AbstractEventLoop,
                preset: str = config.DEFAULT_PRESET) -> dict:
     """저장된 오디오 파일 하나를 정밀 변환 큐에 넣는다."""
     duration = audio.probe_duration(src)
-    model = config.PRESETS[preset].get("model") or transcriber.model_name
-    db.create_job(job_id, title, str(src), model, duration)
-    JOBS[job_id] = JobState()
-    EXECUTOR.submit(_run_job, job_id, src, loop, denoise, prompt, preset)
+    db.create_job(job_id, title, str(src), _model_for(preset), duration, preset)
+    _enqueue(job_id, src, loop, denoise, prompt, preset)
     return {"job_id": job_id, "title": title, "duration_sec": round(duration, 1)}
+
+
+def _preset_of(rec: dict) -> str:
+    """기록의 녹음 환경. 이 컬럼이 생기기 전 기록은 쓴 모델로 추정한다."""
+    if rec.get("preset") in config.PRESETS:
+        return rec["preset"]
+    for name, p in config.PRESETS.items():
+        if p.get("model") and p["model"] == rec.get("model"):
+            return name
+    return config.DEFAULT_PRESET
+
+
+def _resume(rec: dict, loop: asyncio.AbstractEventLoop) -> dict:
+    src = Path(rec.get("audio_path") or "")
+    if not src.exists():
+        raise HTTPException(404, "원본 오디오가 없어 이어서 변환할 수 없습니다.")
+    preset = _preset_of(rec)
+    _enqueue(rec["id"], src, loop, preset=preset)
+    return {"job_id": rec["id"], "from_sec": rec["progress_sec"],
+            "duration_sec": rec["duration_sec"], "model": _model_for(preset)}
+
+
+@app.post("/api/transcripts/{job_id}/resume")
+async def resume(job_id: str):
+    """끊긴 변환을 저장된 지점부터 이어서 한다."""
+    rec = db.get(job_id)
+    if not rec:
+        raise HTTPException(404, "없는 기록입니다.")
+    if rec["status"] not in ("interrupted", "error"):
+        raise HTTPException(409, "이어서 변환할 수 있는 상태가 아닙니다.")
+    return _resume(rec, asyncio.get_running_loop())
 
 
 @app.post("/api/transcribe")
@@ -190,16 +303,28 @@ async def ws_live(ws: WebSocket):
 
     수신: 16kHz mono int16 PCM 바이너리 프레임, 그리고 {"type":"stop"} 텍스트
     송신: draft (small 초안) → finalizing (job_id) → 이후는 /ws/progress 가 이어받음
+
+    녹음을 시작하는 순간 기록을 만들고, 소리는 .pcm 파일에, 초안은 DB 에 계속 저장한다.
+    탭이 닫히거나 서버가 꺼져도 그때까지의 녹음과 초안이 남고 "이어서 변환"으로 마무리할 수 있다.
     """
     await ws.accept()
     loop = asyncio.get_running_loop()
     preset = ws.query_params.get("preset", config.DEFAULT_PRESET)
     if preset not in config.PRESETS:
         preset = config.DEFAULT_PRESET
-    sess = live.LiveSession(live_gain=config.PRESETS[preset]["live_gain"])
+
+    job_id = uuid.uuid4().hex[:12]
+    wav_path = config.UPLOAD_DIR / f"{job_id}.wav"
+    pcm_path = config.UPLOAD_DIR / f"{job_id}.pcm"
+    default_title = "실시간_" + datetime.now().strftime("%y%m%d%H%M")
+    db.create_job(job_id, default_title, str(wav_path), _model_for(preset), 0.0, preset,
+                  status="recording")
+    sess = live.LiveSession(live_gain=config.PRESETS[preset]["live_gain"], pcm_path=pcm_path)
     glossary = postprocess.load_glossary()
     prompt, replacements = glossary["prompt"], glossary["replacements"]
+    drafts: list[dict] = []
     draining = False
+    finished = False
 
     async def drain(final: bool = False) -> None:
         """확정된 발화를 꺼내 초안 변환 후 밀어준다."""
@@ -224,16 +349,29 @@ async def ws_live(ws: WebSocket):
                     seg = {"start": round(start / live.SR, 2),
                            "end": round(end / live.SR, 2), "text": text,
                            "gain_db": round(20 * math.log10(sess.gain), 1)}
-                    sess.segments.append(seg)
-                    await ws.send_json({"type": "draft", **seg})
+                    drafts.append(seg)
+                    db.set_drafts(job_id, drafts)      # 서버가 꺼져도 초안은 남게
+                    if not finished:
+                        await ws.send_json({"type": "draft", **seg})
                 if not final:
                     break                     # 한 번에 한 발화씩만
         finally:
             draining = False
 
+    async def close_recording() -> bool:
+        """녹음 파일을 확정한다. 너무 짧으면 기록째 지우고 False."""
+        sess.close_file()
+        if sess.total_samples < live.SR * 0.5:
+            pcm_path.unlink(missing_ok=True)
+            db.delete(job_id)
+            return False
+        await loop.run_in_executor(LIVE_POOL, partial(sess.save_wav, wav_path))
+        pcm_path.unlink(missing_ok=True)
+        return True
+
     try:
         await ws.send_json({"type": "ready", "model": config.LIVE_MODEL,
-                            "preset": preset})
+                            "preset": preset, "job_id": job_id})
         while True:
             msg = await ws.receive()
             if msg.get("type") == "websocket.disconnect":
@@ -255,20 +393,17 @@ async def ws_live(ws: WebSocket):
 
             # ── 종료: 남은 발화를 비우고 전체를 정밀 변환으로 넘긴다 ──
             await drain(final=True)
-            if sess.total_samples < live.SR * 0.5:
+            finished = True
+            if not await close_recording():
                 await ws.send_json({"type": "error", "message": "녹음이 너무 짧습니다."})
                 return
 
-            job_id = uuid.uuid4().hex[:12]
-            src = config.UPLOAD_DIR / f"{job_id}.wav"
-            await loop.run_in_executor(LIVE_POOL, partial(sess.save_wav, src))
-
-            title = (data.get("title") or "").strip() or "실시간 녹음"
-            info = _start_job(job_id, src, title,
-                              bool(data.get("denoise", True)), None, loop, preset)
-            await ws.send_json({"type": "finalizing", **info,
-                                "model": config.PRESETS[preset].get("model")
-                                or transcriber.model_name})
+            title = (data.get("title") or "").strip() or default_title
+            db.set_recorded(job_id, title=title, duration_sec=sess.duration_sec, status="queued")
+            _enqueue(job_id, wav_path, loop, bool(data.get("denoise", True)), None, preset)
+            await ws.send_json({"type": "finalizing", "job_id": job_id, "title": title,
+                                "duration_sec": round(sess.duration_sec, 1),
+                                "model": _model_for(preset)})
             return
     except WebSocketDisconnect:
         pass
@@ -278,6 +413,18 @@ async def ws_live(ws: WebSocket):
             await ws.send_json({"type": "error", "message": str(e)})
         except Exception:
             pass
+    finally:
+        if not finished:
+            # 정지 버튼 없이 끊김 (탭 닫힘, 새로고침, 네트워크) — 녹음은 살려서 "중단됨"으로
+            finished = True
+            try:
+                if await close_recording():
+                    db.set_recorded(job_id, title=None, duration_sec=sess.duration_sec,
+                                    status="interrupted",
+                                    error="녹음 중 연결이 끊겼습니다 (탭 닫힘 등). "
+                                          "그때까지의 녹음은 저장됐고, 이어서 변환할 수 있습니다.")
+            except Exception:
+                traceback.print_exc()
 
 
 @app.websocket("/ws/progress/{job_id}")
@@ -315,6 +462,11 @@ def get_job(job_id: str):
     if state and rec["status"] == "running":
         rec["segments"] = state.segments
         rec["percent"] = state.percent
+    if rec["status"] == "done":
+        rec["drafts"] = []
+    else:
+        covered = max([rec["progress_sec"]] + [s["end"] for s in rec["segments"]])
+        rec["drafts"] = [d for d in rec["drafts"] if d["start"] >= covered - 0.5]
     return rec
 
 
@@ -333,6 +485,7 @@ def delete_transcript(job_id: str):
     if rec and rec.get("audio_path"):
         Path(rec["audio_path"]).unlink(missing_ok=True)
     _listening_wav_path(job_id).unlink(missing_ok=True)
+    (config.UPLOAD_DIR / f"{job_id}.pcm").unlink(missing_ok=True)
     db.delete(job_id)
     JOBS.pop(job_id, None)
     JOBS.pop(f"cmp-{job_id}", None)
