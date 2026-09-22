@@ -14,7 +14,7 @@ FFPROBE = shutil.which("ffprobe") or "ffprobe"
 # 필터 체인은 녹음 환경별로 config.PRESETS 에 있다 (DESIGN.md §5.3, §5.6)
 #   highpass   : 에어컨/책상 진동 등 저주파 제거
 #   loudnorm   : EBU R128 음량 정규화 — 파일 전체 음량을 맞춘다
-#   dynaudnorm : 구간별 동적 증폭 — 작게 말한 구간만 따로 끌어올린다 (강의실)
+#   (dynaudnorm·speechnorm·RNNoise 는 강의실 녹음에서 오히려 CER 이 나빠져 쓰지 않는다)
 
 
 class AudioError(RuntimeError):
@@ -36,6 +36,20 @@ def probe_duration(path: Path) -> float:
         return float(json.loads(out.stdout)["format"]["duration"])
     except Exception:
         return 0.0
+
+
+def to_listening_wav(src: Path, dst: Path) -> Path:
+    """교정 모드 재생용. 필터 없이 모노 WAV 로만 바꾼다.
+
+    브라우저로 녹음한 webm 은 탐색 정보가 없어 특정 시점으로 정확히 이동하지 못한다.
+    WAV 는 항상 정확히 이동된다. 듣기용이라 음질을 위해 샘플레이트는 원본 그대로 둔다.
+    """
+    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+           "-i", str(src.resolve()), "-ac", "1", "-c:a", "pcm_s16le", str(dst.resolve())]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or not dst.exists():
+        raise AudioError(f"재생용 변환 실패: {proc.stderr.strip()[:300]}")
+    return dst
 
 
 def to_wav(src: Path, dst: Path, *, preset: str = config.DEFAULT_PRESET,

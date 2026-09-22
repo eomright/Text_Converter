@@ -3,10 +3,11 @@
 모델은 프로세스당 1회만 로드해서 메모리에 상주시킨다.
 매 요청마다 로드하면 요청당 20~30초를 그냥 버린다.
 
-하이브리드 실시간 모드 때문에 **두 모델을 동시에 상주**시킨다.
+용도별로 **여러 모델을 동시에 상주**시킨다 (안 쓰는 모델은 _evict_unused 가 내림).
   - LIVE_MODEL (small)      : 녹음 중 발화 단위 초안. 고정 비용 1.8초
   - DEFAULT_MODEL (turbo)   : 녹음 종료 후 전체 정밀 변환. 고정 비용 7초
-근거 수치는 config.LIVE_MODEL 주석 참고.
+  - large-v3                : 강의실 모드 정밀 변환, 교정 모드 비교 분석
+근거 수치는 config.LIVE_MODEL / config.PRESETS 주석 참고.
 """
 from __future__ import annotations
 
@@ -145,6 +146,34 @@ class Transcriber:
                     on_segment(item, pct)
 
         return out, total, time.time() - started
+
+    def transcribe_words(
+        self,
+        wav_path: Path,
+        model_name: str,
+        *,
+        on_progress: Callable[[float], None] | None = None,
+    ) -> list[dict]:
+        """교정 모드의 모델 비교용: 단어별 타임스탬프만 뽑는다.
+
+        원래 결과와 구간 경계가 달라도 단어 시점으로 맞춰 비교하기 위해서다.
+        용어집은 넣지 않는다 — 같은 힌트를 주면 같은 방향으로 틀려서 비교 의미가 줄어든다.
+        """
+        model = self.get_model(model_name)
+        opts = dict(config.TRANSCRIBE_OPTS)
+        opts["vad_parameters"] = dict(opts["vad_parameters"])
+        opts["word_timestamps"] = True
+        words: list[dict] = []
+        with self._infer_lock(model_name):
+            seg_iter, info = model.transcribe(str(wav_path), **opts)
+            total = float(getattr(info, "duration", 0.0)) or 0.0
+            for s in seg_iter:
+                for w in (s.words or []):
+                    words.append({"start": float(w.start), "end": float(w.end),
+                                  "word": w.word or ""})
+                if on_progress and total:
+                    on_progress(min(99.0, float(s.end) / total * 100.0))
+        return words
 
     def transcribe_array(self, audio, *, initial_prompt: str = "") -> str:
         """실시간용: numpy float32 배열 하나를 받아 텍스트만 빠르게 돌려준다.

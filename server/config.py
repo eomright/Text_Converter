@@ -13,7 +13,8 @@ RUNTIME_DIR = Path(
 
 DATA_DIR = RUNTIME_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
-MODEL_DIR = DATA_DIR / "models"
+# 모델 폴더만 따로 지정할 수 있다 — 테스트용 런타임을 분리해도 수 GB 모델은 공유하려고
+MODEL_DIR = Path(os.environ.get("KSTT_MODEL_DIR", DATA_DIR / "models")).resolve()
 EVAL_DIR = DATA_DIR / "eval"
 DB_PATH = DATA_DIR / "app.db"
 GLOSSARY_PATH = DATA_DIR / "glossary.json"
@@ -126,6 +127,13 @@ LIVE_SILENCE_MS = 500
 LIVE_MAX_UTTERANCE_S = 20.0
 # 이 길이 미만의 조각은 너무 짧아 인식이 불안정하므로 다음 발화와 합친다
 LIVE_MIN_UTTERANCE_S = 0.6
+
+# ── 교정 모드 ────────────────────────────────────────────────────────
+# "모델 비교 분석"에서 원래 결과와 비교할 모델 후보. 원래 결과를 만든 모델은 자동으로 빠진다.
+# 큰 모델끼리 다르게 들은 곳에 ⚠를 붙인다. small 은 소리가 나쁘면 대부분 틀려서
+# ⚠ 판정에는 쓰지 않고 참고용으로만 보여준다 (강의실 녹음 초안 CER 55%).
+COMPARE_MODELS = ["large-v3-turbo", "large-v3"]
+COMPARE_REFERENCE_ONLY = ["small"]
 
 HOST = os.environ.get("KSTT_HOST", "127.0.0.1")
 PORT = int(os.environ.get("KSTT_PORT", "8000"))

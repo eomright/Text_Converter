@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import shutil
 import threading
 import traceback
 import urllib.parse
@@ -19,7 +20,7 @@ from fastapi import (
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import audio, config, db, live, postprocess
+from . import audio, config, db, live, postprocess, review
 from .transcriber import transcriber
 
 
@@ -322,20 +323,141 @@ def list_transcripts(limit: int = 50):
     return db.list_recent(limit)
 
 
+def _listening_wav_path(job_id: str) -> Path:
+    return config.UPLOAD_DIR / f"{job_id}.listen.wav"
+
+
 @app.delete("/api/transcripts/{job_id}")
 def delete_transcript(job_id: str):
     rec = db.get(job_id)
     if rec and rec.get("audio_path"):
         Path(rec["audio_path"]).unlink(missing_ok=True)
+    _listening_wav_path(job_id).unlink(missing_ok=True)
     db.delete(job_id)
     JOBS.pop(job_id, None)
+    JOBS.pop(f"cmp-{job_id}", None)
     return {"ok": True}
 
 
-@app.put("/api/transcripts/{job_id}/text")
-def edit_text(job_id: str, payload: dict):
-    db.update_text(job_id, str(payload.get("text", "")))
-    return {"ok": True}
+def _require_done(job_id: str) -> dict:
+    rec = db.get(job_id)
+    if not rec:
+        raise HTTPException(404, "없는 기록입니다.")
+    if rec["status"] != "done":
+        # 변환이 끝나면 결과가 통째로 덮어써지므로, 그 전에 고친 내용은 사라진다
+        raise HTTPException(409, "변환이 끝난 뒤에 수정할 수 있습니다.")
+    return rec
+
+
+@app.put("/api/transcripts/{job_id}/segments")
+def save_segments(job_id: str, payload: dict):
+    """화면에서 고친 구간 저장. 전문(txt 내보내기용)도 같이 다시 만든다."""
+    _require_done(job_id)
+    try:
+        segs = review.sanitize_segments(payload.get("segments"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    db.update_segments(job_id, segs, postprocess.to_paragraphs(segs))
+    return {"ok": True, "count": len(segs)}
+
+
+# ── 교정 모드: 모델 비교 분석 ───────────────────────────────────────────
+def _run_compare(key: str, job_id: str, models: list[str],
+                 loop: asyncio.AbstractEventLoop) -> None:
+    """다른 모델로 한 번 더 변환해, 원래 결과와 다르게 들은 구간에 ⚠ 를 붙인다."""
+    state = JOBS[key]
+
+    def push(msg: dict) -> None:
+        loop.call_soon_threadsafe(state.emit, msg)
+
+    rec = db.get(job_id)
+    wav = config.UPLOAD_DIR / f"{job_id}.compare.wav"
+    try:
+        push({"type": "status", "stage": "전처리"})
+        audio.to_wav(Path(rec["audio_path"]), wav, preset="standard")
+
+        words_by_model: dict[str, list[dict]] = {}
+        for i, name in enumerate(models):
+            step = f"{i + 1}/{len(models)} {name}"
+            if name not in transcriber.loaded_names():
+                push({"type": "status", "stage": f"{step} 불러오는 중 (최초 30초 정도)"})
+                transcriber.get_model(name)
+            push({"type": "status", "stage": f"{step} 변환 중"})
+
+            def on_progress(pct: float, i=i) -> None:
+                push({"type": "progress",
+                      "percent": round((i + pct / 100) / len(models) * 100, 1)})
+
+            words_by_model[name] = transcriber.transcribe_words(
+                wav, name, on_progress=on_progress)
+
+        # 분석하는 동안 사용자가 고쳤을 수 있으니 마지막에 최신 저장본을 다시 읽어 합친다
+        latest = db.get(job_id)
+        segs = latest["segments"]
+        alts = {m: review.align_words(segs, w) for m, w in words_by_model.items()}
+        flagged = review.apply_comparison(segs, alts, set(config.COMPARE_REFERENCE_ONLY))
+        db.update_segments(job_id, segs, postprocess.to_paragraphs(segs))
+        push({"type": "done", "flagged": flagged, "models": models,
+              "segments": [{"alts": s.get("alts", {}), "flag": s.get("flag")}
+                           for s in segs]})
+    except Exception as e:
+        traceback.print_exc()
+        push({"type": "error", "message": str(e)})
+    finally:
+        wav.unlink(missing_ok=True)
+
+
+@app.post("/api/transcripts/{job_id}/compare")
+async def compare(job_id: str, payload: dict | None = None):
+    rec = _require_done(job_id)
+    if not rec.get("audio_path") or not Path(rec["audio_path"]).exists():
+        raise HTTPException(404, "원본 오디오가 없습니다.")
+
+    key = f"cmp-{job_id}"
+    prev = JOBS.get(key)
+    if prev and not any(e.get("type") in ("done", "error") for e in prev.events):
+        raise HTTPException(409, "이미 분석 중입니다.")
+
+    models = [m for m in config.COMPARE_MODELS if m != rec.get("model")]
+    if (payload or {}).get("include_small"):
+        models += [m for m in config.COMPARE_REFERENCE_ONLY if m != rec.get("model")]
+
+    JOBS[key] = JobState()
+    EXECUTOR.submit(_run_compare, key, job_id, models, asyncio.get_running_loop())
+    return {"job_id": key, "models": models}
+
+
+# ── 교정 모드: 평가용 정답으로 저장 ─────────────────────────────────────
+AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".webm", ".ogg", ".flac", ".mp4"}
+
+
+@app.post("/api/transcripts/{job_id}/save-eval")
+def save_eval(job_id: str, payload: dict):
+    """오디오와 고친 받아쓰기를 같은 이름으로 평가 폴더에 저장 (scripts/benchmark.py 가 짝지어 읽음)."""
+    rec = _require_done(job_id)
+    src = Path(rec.get("audio_path") or "")
+    if not src.exists():
+        raise HTTPException(404, "원본 오디오가 없습니다.")
+
+    # 기본 이름은 기록 제목. 제목에도 허용 안 되는 문자가 있을 수 있어 한 번 더 거른다
+    name = review.safe_eval_name(
+        review.safe_eval_name(str(payload.get("name", "")), fallback=rec["title"]))
+    # 정확히 같은 이름만 대상 — "강의1.large-v3.hyp.txt" 같은 벤치마크 결과는 건드리지 않는다
+    existing = [p for p in config.EVAL_DIR.glob(f"{name}.*")
+                if p.stem == name and p.suffix.lower() in AUDIO_EXTS | {".txt"}]
+    if existing and not payload.get("overwrite"):
+        raise HTTPException(409, f"같은 이름이 이미 있습니다: {name}")
+    for p in existing:            # 확장자가 다른 옛 오디오가 남아 짝이 둘이 되지 않게
+        p.unlink(missing_ok=True)
+
+    audio_dst = config.EVAL_DIR / f"{name}{src.suffix.lower()}"
+    txt_dst = config.EVAL_DIR / f"{name}.txt"
+    shutil.copyfile(src, audio_dst)
+    txt_dst.write_text("\n".join(s["text"] for s in rec["segments"] if s.get("text")) + "\n",
+                       encoding="utf-8")
+    return {"ok": True, "dir": str(config.EVAL_DIR),
+            "audio": audio_dst.name, "txt": txt_dst.name,
+            "unchecked": sum(1 for s in rec["segments"] if not s.get("checked"))}
 
 
 @app.get("/api/transcripts/{job_id}/export")
@@ -361,13 +483,22 @@ def export(job_id: str, fmt: str = "txt"):
 
 
 @app.get("/api/audio/{job_id}")
-def get_audio(job_id: str):
+def get_audio(job_id: str, format: str = ""):
     rec = db.get(job_id)
     if not rec or not rec.get("audio_path"):
         raise HTTPException(404, "오디오 없음")
     p = Path(rec["audio_path"])
     if not p.exists():
         raise HTTPException(404, "파일이 삭제되었습니다.")
+    if format == "wav":
+        # 교정 모드는 구간 단위로 정확히 이동해야 해서 WAV 로 한 번 변환해 캐시해둔다
+        listen = _listening_wav_path(job_id)
+        if not listen.exists():
+            try:
+                audio.to_listening_wav(p, listen)
+            except audio.AudioError as e:
+                raise HTTPException(500, str(e))
+        return FileResponse(listen, media_type="audio/wav")
     return FileResponse(p)
 
 

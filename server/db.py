@@ -93,10 +93,13 @@ def list_recent(limit: int = 50) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def update_text(job_id: str, text: str) -> None:
-    """사용자가 UI에서 직접 교정한 내용을 반영."""
+def update_segments(job_id: str, segments: list[dict], text: str) -> None:
+    """사용자가 고친 구간과, 그걸로 다시 만든 전문을 함께 저장 (내보내기가 둘 다 쓰므로)."""
     with conn() as c:
-        c.execute("UPDATE transcripts SET text=? WHERE id=?", (text, job_id))
+        c.execute(
+            "UPDATE transcripts SET segments_json=?, text=? WHERE id=?",
+            (json.dumps(segments, ensure_ascii=False), text, job_id),
+        )
 
 
 def delete(job_id: str) -> None:

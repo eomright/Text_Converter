@@ -141,6 +141,42 @@
   .kv span{color:var(--dim)}
   .chk{display:flex; align-items:center; gap:8px; margin-top:12px; font-size:13px}
 
+  /* ── 교정 모드 ── */
+  .review{position:fixed; inset:0; background:var(--bg); z-index:50; display:flex; flex-direction:column}
+  .rv-bar{max-width:980px; width:100%; margin:0 auto; padding:14px 16px 0}
+  .rv-head, .rv-tools{display:flex; align-items:center; gap:8px; flex-wrap:wrap}
+  .rv-head h2{font-size:16px; margin:0; font-weight:600; max-width:320px;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+  .rv-tools{margin-top:10px; padding-top:10px; border-top:1px solid var(--line)}
+  .rv-tools input[type=text]{background:var(--panel2); color:var(--fg); border:1px solid var(--line);
+    border-radius:8px; padding:6px 10px; font:inherit; font-size:12.5px; width:180px}
+  .rv-tools select, .rv-head select{background:var(--panel2); color:var(--fg); border:1px solid var(--line);
+    border-radius:8px; padding:5px 8px; font:inherit; font-size:12.5px}
+  .rv-keys{font-size:12px; color:var(--dim); margin:10px 0 8px}
+  .rv-keys kbd{background:var(--panel2); border:1px solid var(--line); border-bottom-width:2px;
+    border-radius:5px; padding:0 5px; font:inherit; font-size:11.5px; color:var(--fg)}
+  .badge.warn{color:var(--warn); border-color:#5a4520}
+  .rv-list{flex:1; overflow-y:auto; max-width:980px; width:100%; margin:0 auto; padding:4px 16px 40vh}
+  .rv-row{display:flex; gap:10px; align-items:flex-start; padding:8px 10px; border-radius:10px;
+    border:1px solid transparent; cursor:pointer}
+  .rv-row:hover{background:var(--panel)}
+  .rv-row.cur{background:var(--panel); border-color:var(--accent2)}
+  .rv-ic{flex:none; width:22px; text-align:center; font-size:14px; padding-top:1px; user-select:none; color:var(--dim)}
+  .rv-row.flag .rv-ic{color:var(--warn)}
+  .rv-row.done .rv-ic{color:var(--ok)}
+  .rv-ts{flex:none; font-variant-numeric:tabular-nums; font-size:12px; color:var(--accent);
+    padding-top:3px; min-width:118px; user-select:none}
+  .rv-body{flex:1; min-width:0}
+  .rv-tx{outline:none; white-space:pre-wrap; word-break:break-word; padding:1px 4px; border-radius:4px; cursor:text}
+  .rv-row.cur .rv-tx{background:rgba(255,255,255,.05)}
+  .rv-row.done:not(.cur) .rv-tx{color:var(--dim)}
+  .rv-alt{font-size:12.5px; color:var(--dim); margin-top:3px; padding-left:4px}
+  .rv-alt b{color:var(--warn); font-weight:500}
+  .rv-play{flex:none; background:none; border:1px solid var(--line); color:var(--dim);
+    border-radius:6px; width:28px; height:26px; cursor:pointer}
+  .rv-play:hover{color:var(--fg); border-color:var(--accent)}
+  .rv-empty{color:var(--dim); text-align:center; padding:40px 0}
+
   .toast{
     position:fixed; bottom:22px; left:50%; transform:translateX(-50%);
     background:var(--panel2); border:1px solid var(--line); padding:10px 18px;
@@ -219,6 +255,8 @@
       <h2 id="resultTitle">변환 결과</h2>
       <span class="badge hidden" id="statBadge"></span>
       <div class="spacer"></div>
+      <span class="hint" id="saveState"></span>
+      <button class="sm" id="reviewBtn" disabled title="들으면서 한 줄씩 고치는 화면">✎ 교정 모드</button>
       <button class="sm primary" id="copyBtn">복사</button>
       <button class="sm" data-fmt="txt">txt</button>
       <button class="sm" data-fmt="srt">srt</button>
@@ -229,11 +267,47 @@
       <div class="tab" data-view="plain">전문</div>
     </div>
     <div class="segs" id="segs"></div>
-    <textarea class="plain hidden" id="plain" placeholder="변환 결과가 여기 표시됩니다"></textarea>
+    <textarea class="plain hidden" id="plain" readonly placeholder="변환 결과가 여기 표시됩니다"></textarea>
     <div class="hint" style="text-align:left;margin-top:10px">
-      시간을 클릭하면 그 지점부터 재생됩니다. 텍스트는 직접 수정할 수 있습니다.
+      시간을 클릭하면 그 지점부터 재생됩니다. 타임스탬프 탭에서 고친 내용은 자동 저장되고 내보내기에도 반영됩니다.
       <span style="color:var(--warn)">주황색</span>은 모델 신뢰도가 낮은 구간이니 확인해보세요.
+      꼼꼼히 고치려면 <b>✎ 교정 모드</b>를 쓰세요.
     </div>
+  </div>
+
+  <!-- 교정 모드 (전체 화면) -->
+  <div class="review hidden" id="review">
+    <div class="rv-bar">
+      <div class="rv-head">
+        <button class="sm" id="rvClose">← 닫기</button>
+        <h2 id="rvTitle">교정 모드</h2>
+        <span class="badge" id="rvProgress">✓ 0 / 0</span>
+        <span class="badge warn" id="rvFlagCount">⚠ 0</span>
+        <div class="spacer"></div>
+        <label class="hint">재생 속도
+          <select id="rvSpeed">
+            <option value="1">1.0x</option><option value="0.9">0.9x</option>
+            <option value="0.8">0.8x</option><option value="0.7">0.7x</option>
+          </select>
+        </label>
+        <label class="hint"><input type="checkbox" id="rvOnlyFlag"> ⚠ 안 끝난 줄만</label>
+        <span class="hint" id="rvSave">저장됨</span>
+      </div>
+      <div class="rv-tools">
+        <button class="sm" id="rvCompare">모델 비교 분석</button>
+        <label class="hint"><input type="checkbox" id="rvIncludeSmall"> small 참고용 추가</label>
+        <span class="hint" id="rvCompareState">다른 모델로 한 번 더 변환해, 다르게 들은 줄에 ⚠를 붙입니다 (녹음 길이의 1~3배 걸림)</span>
+        <div class="spacer"></div>
+        <input type="text" id="rvEvalName" placeholder="정답 파일 이름">
+        <button class="sm primary" id="rvSaveEval">정답으로 저장</button>
+      </div>
+      <div class="rv-keys">
+        <kbd>Tab</kbd> 다음 줄 재생 · <kbd>Shift</kbd>+<kbd>Tab</kbd> 이전 줄 ·
+        <kbd>Ctrl</kbd>+<kbd>Space</kbd> 다시 듣기 · <kbd>Enter</kbd> 확인 후 다음 ·
+        <kbd>Esc</kbd> 정지 · 그냥 타이핑하면 수정
+      </div>
+    </div>
+    <div class="rv-list" id="rvList"></div>
   </div>
 
   <!-- 설정 -->
@@ -297,6 +371,7 @@ const S = {
   audioCtx: null, analyser: null, rafId: null, startTs: 0, timerId: null,
   audioEl: new Audio(), peaks: null, duration: 0,
   segments: [], jobId: null, ws: null,
+  editable: false,       // 변환이 끝난 기록만 수정 가능 (도중에 고치면 완료 시 덮어써짐)
   glossary: { prompt: "", replacements: {} },
   denoise: true, view: "seg",
   // 실시간(하이브리드) 모드
@@ -338,6 +413,59 @@ function toast(msg) {
   const t = $("toast"); t.textContent = msg; t.classList.add("show");
   clearTimeout(t._t); t._t = setTimeout(() => t.classList.remove("show"), 2200);
 }
+const nowHM = () => new Date().toLocaleTimeString("ko-KR", { hour12: false });
+
+// ─────────────────────────────────────────────────────────────────────
+// 고친 구간 저장 — 결과 화면과 교정 모드가 같이 쓴다
+//   · 입력이 멈추고 0.7초 뒤 저장 (타이핑마다 요청하지 않게)
+//   · 요청을 순서대로 줄 세운다 (늦게 보낸 게 먼저 도착해 최신 수정을 덮어쓰지 않게)
+// ─────────────────────────────────────────────────────────────────────
+async function putSegments(id, segs, { keepalive = false } = {}) {
+  const r = await fetch(`/api/transcripts/${id}/segments`, {
+    method: "PUT", keepalive,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ segments: segs }),
+  });
+  if (!r.ok) {
+    let msg = "서버 오류 " + r.status;
+    try { msg = (await r.json()).detail || msg; } catch (_) {}
+    throw new Error(msg);
+  }
+}
+
+function makeSaver(statusEl) {
+  const sv = { id: null, segs: null, dirty: false, timer: null, chain: Promise.resolve() };
+  sv.schedule = (id, segs) => {
+    sv.id = id; sv.segs = segs; sv.dirty = true;
+    $(statusEl).textContent = "수정됨…";
+    clearTimeout(sv.timer);
+    sv.timer = setTimeout(sv.flush, 700);
+  };
+  sv.flush = () => {
+    clearTimeout(sv.timer);
+    if (sv.dirty && sv.id) {
+      const id = sv.id, segs = sv.segs;
+      sv.dirty = false;
+      sv.chain = sv.chain.then(async () => {
+        $(statusEl).textContent = "저장 중…";
+        try {
+          await putSegments(id, segs);
+          if (!sv.dirty) $(statusEl).textContent = `저장됨 ${nowHM()}`;
+        } catch (e) {
+          sv.dirty = true;
+          $(statusEl).textContent = "저장 실패 — " + e.message;
+        }
+      });
+    }
+    return sv.chain;
+  };
+  // 창을 닫는 순간에도 마지막 수정이 날아가지 않게
+  sv.flushOnUnload = () => {
+    if (sv.dirty && sv.id) putSegments(sv.id, sv.segs, { keepalive: true }).catch(() => {});
+  };
+  return sv;
+}
+const mainSaver = makeSaver("saveState");
 
 // ─────────────────────────────────────────────────────────────────────
 // 녹음
@@ -707,6 +835,7 @@ function openSocket(jobId) {
       $("pctLabel").textContent = Math.round(m.percent) + "%";
     } else if (m.type === "done") {
       S.segments = m.segments;
+      setEditable(true);
       renderSegs();
       $("plain").value = m.text;
       $("progBar").style.width = "100%";
@@ -736,10 +865,18 @@ function showError(msg) {
 // 결과 렌더링
 // ─────────────────────────────────────────────────────────────────────
 function resetResult() {
+  mainSaver.flush();   // 다른 기록으로 넘어가기 전에 이전 수정 저장 (대상 id 는 저장기가 기억)
+  setEditable(false);
   S.segments = []; $("segs").innerHTML = ""; $("plain").value = "";
   S.drafts = []; S.finalizing = false; S.clearedDrafts = false;
   $("progBar").style.width = "0"; $("pctLabel").textContent = "0%";
   $("errBox").classList.add("hidden"); $("statBadge").classList.add("hidden");
+}
+
+function setEditable(on) {
+  S.editable = on;
+  $("reviewBtn").disabled = !on;
+  if (!on) $("saveState").textContent = "";
 }
 
 function segEl(s, i) {
@@ -749,9 +886,14 @@ function segEl(s, i) {
   d.innerHTML = `<span class="ts">${fmtTime(s.start)}</span>`;
   const tx = document.createElement("div");
   tx.className = "tx";
-  tx.contentEditable = "true";
+  tx.contentEditable = S.editable ? "true" : "false";
   tx.textContent = s.text;
-  tx.oninput = () => { S.segments[i].text = tx.textContent; syncPlain(); };
+  tx.oninput = () => {
+    S.segments[i].text = tx.textContent.replace(/\s*\n\s*/g, " ");
+    syncPlain();
+    mainSaver.schedule(S.jobId, S.segments);
+  };
+  tx.onkeydown = (e) => { if (e.key === "Enter") e.preventDefault(); };  // 한 구간 = 한 줄
   d.appendChild(tx);
   d.querySelector(".ts").onclick = () => seek(s.start);
   return d;
@@ -997,10 +1139,10 @@ async function loadHistory() {
 
 async function openTranscript(id) {
   const rec = await fetch("/api/jobs/" + id).then((r) => r.json());
+  resetResult();
   S.jobId = id;
   S.segments = rec.segments || [];
-  resetResult();
-  S.segments = rec.segments || [];
+  setEditable(rec.status === "done");
   renderSegs();
   $("plain").value = rec.text || "";
   $("resultTitle").textContent = rec.title;
@@ -1020,6 +1162,412 @@ async function openTranscript(id) {
 
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// 교정 모드 — 한 줄씩 들으면서 고치는 전체 화면
+//   줄을 고르면 그 구간만 재생하고 끝에서 멈춘다. 키보드만으로 진행할 수 있다.
+// ─────────────────────────────────────────────────────────────────────
+const R = {
+  id: null, segs: [], cur: -1,
+  audio: new Audio(), raf: 0, stopAt: 0,
+  ws: null, evalArm: "", evalArmTimer: null,
+};
+R.audio.preload = "auto";
+const reviewSaver = makeSaver("rvSave");
+
+const LOW_LOGPROB = -0.9, HIGH_NO_SPEECH = 0.6;   // 결과 화면 주황색 기준과 같게
+const PRE_ROLL = 0.15, POST_ROLL = 0.25;          // 구간 경계에서 첫·끝 음절이 잘리지 않게
+const COMPARE_HINT = $("rvCompareState").textContent;
+
+const reviewOpen = () => !$("review").classList.contains("hidden");
+const isFlagged = (s) => s.flag === "disagree" ||
+  (typeof s.avg_logprob === "number" && s.avg_logprob < LOW_LOGPROB) ||
+  (typeof s.no_speech_prob === "number" && s.no_speech_prob > HIGH_NO_SPEECH);
+// 서버 review.normalize 와 같은 규칙: 띄어쓰기·문장부호·대소문자 차이는 같은 것으로 본다
+const normText = (t) => (t || "").replace(/[\s.,!?~"'`\-—…·:;()\[\]{}「」『』]+/g, "").toLowerCase();
+const fmtPrecise = (t) => {
+  t = Math.max(0, t || 0);
+  const m = Math.floor(t / 60);
+  return String(m).padStart(2, "0") + ":" + (t - m * 60).toFixed(1).padStart(4, "0");
+};
+const rowOf = (i) => $("rvList").querySelector(`.rv-row[data-i="${i}"]`);
+
+async function openReview(id) {
+  await mainSaver.flush();
+  let rec;
+  try {
+    const r = await fetch("/api/jobs/" + id);
+    if (!r.ok) throw new Error(r.status);
+    rec = await r.json();
+  } catch (_) { return toast("기록을 불러오지 못했습니다"); }
+  if (rec.status !== "done") return toast("변환이 끝난 뒤에 교정할 수 있습니다");
+
+  S.audioEl.pause();
+  R.id = id;
+  R.segs = rec.segments || [];
+  R.cur = -1;
+  disarmEval();
+  $("rvTitle").textContent = rec.title;
+  $("rvEvalName").value = rec.title;
+  $("rvSave").textContent = "저장됨";
+  $("rvCompare").textContent = R.segs.some((s) => s.alts) ? "다시 분석" : "모델 비교 분석";
+  $("rvCompare").disabled = false;
+  $("rvCompareState").textContent = R.segs.some((s) => s.alts)
+    ? "이전 비교 분석 결과가 표시되어 있습니다" : COMPARE_HINT;
+
+  // WAV 로 받아야 구간 단위로 정확히 이동된다 (첫 요청 때 서버가 한 번 변환)
+  R.audio.src = `/api/audio/${id}?format=wav`;
+  R.audio.defaultPlaybackRate = R.audio.playbackRate = +$("rvSpeed").value;
+
+  $("review").classList.remove("hidden");
+  document.body.style.overflow = "hidden";
+  renderReview();
+  const first = R.segs.findIndex((s) => !s.checked);
+  setCur(first >= 0 ? first : 0, { play: false });
+}
+
+async function closeReview() {
+  stopSeg();
+  await reviewSaver.flush();
+  $("review").classList.add("hidden");
+  document.body.style.overflow = "";
+  // 결과 화면이 같은 기록을 보고 있으면 교정한 내용으로 갱신
+  if (S.jobId === R.id) {
+    S.segments = R.segs.map((s) => ({ ...s }));
+    renderSegs();
+    syncPlain();
+  }
+}
+
+function visibleRows() {
+  const only = $("rvOnlyFlag").checked;
+  const out = [];
+  R.segs.forEach((s, i) => {
+    if (!only || (isFlagged(s) && !s.checked) || i === R.cur) out.push(i);
+  });
+  return out;
+}
+
+function renderReview() {
+  const list = $("rvList");
+  list.innerHTML = "";
+  const idx = visibleRows();
+  if (!idx.length) {
+    const e = document.createElement("div");
+    e.className = "rv-empty";
+    e.textContent = $("rvOnlyFlag").checked
+      ? "⚠ 표시된 줄을 모두 확인했습니다" : "구간이 없습니다";
+    list.appendChild(e);
+  }
+  idx.forEach((i) => list.appendChild(rvRow(i)));
+  updateReviewCounts();
+}
+
+function applyRowState(row, i) {
+  const s = R.segs[i];
+  const flagged = isFlagged(s) && !s.checked;
+  row.classList.toggle("cur", i === R.cur);
+  row.classList.toggle("done", !!s.checked);
+  row.classList.toggle("flag", flagged);
+  row.querySelector(".rv-ic").textContent = s.checked ? "✓" : flagged ? "⚠" : "·";
+}
+
+function altLines(s) {
+  if (!s.alts) return [];
+  const base = normText(s.text);
+  return Object.entries(s.alts)
+    .filter(([, t]) => normText(t) !== base)
+    .map(([model, t]) => {
+      const d = document.createElement("div");
+      d.className = "rv-alt";
+      d.append(`${model}: `);
+      const b = document.createElement("b");
+      b.textContent = t || "(못 들음)";
+      d.appendChild(b);
+      return d;
+    });
+}
+
+function rvRow(i) {
+  const s = R.segs[i];
+  const row = document.createElement("div");
+  row.className = "rv-row";
+  row.dataset.i = i;
+
+  const ic = document.createElement("span");
+  ic.className = "rv-ic";
+  ic.title = "클릭: 확인 표시 켜기/끄기";
+  ic.onclick = (e) => {
+    e.stopPropagation();
+    s.checked = !s.checked;
+    applyRowState(row, i);
+    updateReviewCounts();
+    reviewSaver.schedule(R.id, R.segs);
+  };
+
+  const ts = document.createElement("span");
+  ts.className = "rv-ts";
+  ts.textContent = `${fmtPrecise(s.start)} – ${fmtPrecise(s.end)}`;
+
+  const body = document.createElement("div");
+  body.className = "rv-body";
+  const tx = document.createElement("div");
+  tx.className = "rv-tx";
+  tx.contentEditable = "true";
+  tx.spellcheck = false;
+  tx.textContent = s.text;   // textContent 만 사용 — 받아쓰기 내용이 HTML 로 해석되지 않게
+  tx.oninput = () => {
+    s.text = tx.textContent.replace(/\s*\n\s*/g, " ");
+    reviewSaver.schedule(R.id, R.segs);
+  };
+  tx.onfocus = () => { if (R.cur !== i) setCur(i, { play: true, focus: false }); };
+  body.appendChild(tx);
+  altLines(s).forEach((el) => body.appendChild(el));
+
+  const play = document.createElement("button");
+  play.className = "rv-play";
+  play.textContent = "↻";
+  play.title = "이 줄 다시 듣기 (Ctrl+Space)";
+  play.onclick = (e) => { e.stopPropagation(); setCur(i, { play: true }); };
+
+  row.onclick = () => { if (R.cur !== i) setCur(i, { play: true }); };
+  row.append(ic, ts, body, play);
+  applyRowState(row, i);
+  return row;
+}
+
+function updateReviewCounts() {
+  const done = R.segs.filter((s) => s.checked).length;
+  const flags = R.segs.filter((s) => isFlagged(s) && !s.checked).length;
+  $("rvProgress").textContent = `✓ ${done} / ${R.segs.length}`;
+  $("rvFlagCount").textContent = `⚠ ${flags}`;
+}
+
+function caretToEnd(el) {
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  range.collapse(false);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+function setCur(i, { play = true, focus = true, scroll = true } = {}) {
+  if (i < 0 || i >= R.segs.length) return;
+  const prev = R.cur;
+  R.cur = i;
+  let row = rowOf(i);
+  if (!row) { renderReview(); row = rowOf(i); }   // 필터로 숨어 있던 줄
+  const prevRow = rowOf(prev);
+  if (prevRow) applyRowState(prevRow, prev);
+  if (row) {
+    applyRowState(row, i);
+    if (scroll) row.scrollIntoView({ block: "center", behavior: "smooth" });
+    if (focus) {
+      const tx = row.querySelector(".rv-tx");
+      tx.focus({ preventScroll: true });
+      caretToEnd(tx);
+    }
+  }
+  if (play) playSeg(i);
+}
+
+function playSeg(i) {
+  const s = R.segs[i], a = R.audio;
+  const go = () => {
+    a.currentTime = Math.max(0, s.start - PRE_ROLL);
+    R.stopAt = s.end + POST_ROLL;
+    a.playbackRate = +$("rvSpeed").value;
+    a.play().catch(() => {});
+    cancelAnimationFrame(R.raf);
+    // timeupdate 는 0.25초 간격이라 다음 줄이 조금 들린다 → 매 프레임 확인
+    const tick = () => {
+      if (a.paused) return;
+      if (a.currentTime >= R.stopAt) { a.pause(); return; }
+      R.raf = requestAnimationFrame(tick);
+    };
+    R.raf = requestAnimationFrame(tick);
+  };
+  if (a.readyState >= 1) go();
+  else a.addEventListener("loadedmetadata", go, { once: true });
+}
+
+function stopSeg() {
+  cancelAnimationFrame(R.raf);
+  R.audio.pause();
+}
+
+function moveCur(delta) {
+  const idx = visibleRows();
+  const next = delta > 0
+    ? idx.find((k) => k > R.cur)
+    : [...idx].reverse().find((k) => k < R.cur);
+  if (next === undefined) return toast(delta > 0 ? "마지막 줄입니다" : "첫 줄입니다");
+  setCur(next, { play: true });
+}
+
+function confirmCur() {
+  const i = R.cur;
+  if (i < 0) return;
+  R.segs[i].checked = true;
+  reviewSaver.schedule(R.id, R.segs);
+  const row = rowOf(i);
+  if (row) applyRowState(row, i);
+  updateReviewCounts();
+
+  const next = visibleRows().find((k) => k > i);
+  if (next === undefined) {
+    stopSeg();
+    return toast(R.segs.every((s) => s.checked)
+      ? "모든 줄을 확인했습니다 — 정답으로 저장할 수 있습니다" : "마지막 줄입니다");
+  }
+  setCur(next, { play: true });
+  // "⚠ 안 끝난 줄만" 보기에서는 방금 확인한 줄을 목록에서 뺀다
+  if ($("rvOnlyFlag").checked && row) row.remove();
+}
+
+document.addEventListener("keydown", (e) => {
+  if (!reviewOpen()) return;
+  if (e.key === "Escape") { e.preventDefault(); stopSeg(); return; }
+  // 상단 입력칸·버튼에서는 원래 키 동작을 그대로 둔다
+  const inList = e.target === document.body || (e.target.closest && e.target.closest("#rvList"));
+  if (!inList) return;
+
+  const composing = e.isComposing || e.keyCode === 229;   // 한글 조합 중
+  if (e.key === "Tab") {
+    e.preventDefault();
+    if (!composing) moveCur(e.shiftKey ? -1 : 1);
+  } else if (e.code === "Space" && e.ctrlKey) {
+    e.preventDefault();
+    if (R.cur >= 0) playSeg(R.cur);
+  } else if (e.key === "Enter" && !e.shiftKey) {
+    // 조합 중 Enter 는 글자를 확정하는 용도라 줄바꿈만 막고 넘어가지 않는다
+    e.preventDefault();
+    if (!composing) confirmCur();
+  }
+}, true);
+
+$("reviewBtn").onclick = () => { if (S.jobId) openReview(S.jobId); };
+$("rvClose").onclick = closeReview;
+$("rvOnlyFlag").onchange = () => {
+  renderReview();
+  if (R.cur >= 0) setCur(R.cur, { play: false });
+};
+$("rvSpeed").onchange = () => {
+  R.audio.defaultPlaybackRate = R.audio.playbackRate = +$("rvSpeed").value;
+  try { localStorage.setItem("kstt_rv_speed", $("rvSpeed").value); } catch (_) {}
+};
+R.audio.onerror = () => { if (reviewOpen()) toast("오디오를 불러오지 못했습니다"); };
+
+// ── 모델 비교 분석 ──
+$("rvCompare").onclick = async () => {
+  if (!R.id) return;
+  await reviewSaver.flush();   // 서버가 분석 끝에 최신 저장본에 결과를 합치므로 먼저 저장
+  $("rvCompare").disabled = true;
+  $("rvCompareState").textContent = "분석 요청 중…";
+  let res;
+  try {
+    const r = await fetch(`/api/transcripts/${R.id}/compare`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ include_small: $("rvIncludeSmall").checked }),
+    });
+    res = await r.json();
+    if (!r.ok) throw new Error(res.detail || r.status);
+  } catch (e) {
+    $("rvCompare").disabled = false;
+    $("rvCompareState").textContent = "분석 시작 실패: " + e.message;
+    return;
+  }
+  watchCompare(R.id, res.job_id, res.models);
+};
+
+function watchCompare(recId, key, models) {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/ws/progress/${key}`);
+  R.ws = ws;
+  let stage = "";
+  const setState = (t) => { if (R.id === recId) $("rvCompareState").textContent = t; };
+  ws.onmessage = (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.type === "status") {
+      stage = m.stage;
+      setState(`분석 중 — ${stage}`);
+    } else if (m.type === "progress") {
+      setState(`분석 중 — ${stage} · 전체 ${Math.round(m.percent)}%`);
+    } else if (m.type === "done") {
+      mergeComparison(recId, m.segments);
+      if (R.id === recId) {
+        $("rvCompare").disabled = false;
+        $("rvCompare").textContent = "다시 분석";
+      }
+      setState(`분석 완료 (${models.join(", ")}) — 다르게 들은 줄 ${m.flagged}개에 ⚠`);
+      toast(`⚠ ${m.flagged}줄 — "⚠ 안 끝난 줄만"을 켜면 그 줄만 볼 수 있습니다`);
+    } else if (m.type === "error") {
+      if (R.id === recId) $("rvCompare").disabled = false;
+      setState("분석 실패: " + m.message);
+    }
+  };
+  ws.onerror = () => {
+    if (R.id === recId) $("rvCompare").disabled = false;
+    setState("연결이 끊겼습니다 — 서버에서는 분석이 계속되고, 다시 열면 결과가 보입니다");
+  };
+}
+
+function mergeComparison(recId, results) {
+  const targets = [];
+  if (R.id === recId) targets.push(R.segs);
+  if (S.jobId === recId && S.segments !== R.segs) targets.push(S.segments);
+  for (const segs of targets) {
+    if (segs.length !== results.length) continue;   // 구간 수가 다르면 다음에 열 때 서버 저장본을 쓴다
+    segs.forEach((s, i) => {
+      s.alts = results[i].alts;
+      if (results[i].flag) s.flag = results[i].flag; else delete s.flag;
+    });
+  }
+  if (R.id === recId && reviewOpen()) {
+    renderReview();
+    if (R.cur >= 0) setCur(R.cur, { play: false, focus: false, scroll: false });
+  }
+}
+
+// ── 평가용 정답으로 저장 ──
+function disarmEval() {
+  R.evalArm = "";
+  $("rvSaveEval").textContent = "정답으로 저장";
+  clearTimeout(R.evalArmTimer);
+}
+function armEval(kind, label) {
+  R.evalArm = kind;
+  $("rvSaveEval").textContent = label;
+  clearTimeout(R.evalArmTimer);
+  R.evalArmTimer = setTimeout(disarmEval, 6000);   // 한참 뒤에 실수로 눌러도 확인 단계부터 다시
+}
+$("rvEvalName").oninput = disarmEval;
+
+$("rvSaveEval").onclick = async () => {
+  if (!R.id) return;
+  const unchecked = R.segs.filter((s) => !s.checked).length;
+  if (unchecked && !R.evalArm) {
+    return armEval("unchecked", `확인 안 한 줄 ${unchecked}개 — 그래도 저장`);
+  }
+  await reviewSaver.flush();   // 서버가 저장된 구간으로 정답 파일을 만든다
+  const r = await fetch(`/api/transcripts/${R.id}/save-eval`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: $("rvEvalName").value, overwrite: R.evalArm === "overwrite" }),
+  });
+  const res = await r.json().catch(() => ({}));
+  if (r.status === 409) return armEval("overwrite", "같은 이름이 있음 — 덮어쓰기");
+  disarmEval();
+  if (!r.ok) return toast("저장 실패: " + (res.detail || r.status));
+  $("rvEvalName").value = res.txt.replace(/\.txt$/, "");
+  $("rvCompareState").textContent = `정답 저장됨 → ${res.dir}\\${res.txt}`;
+  toast(`평가 폴더에 저장: ${res.audio} + ${res.txt}`);
+};
+
+window.addEventListener("beforeunload", () => {
+  mainSaver.flushOnUnload();
+  reviewSaver.flushOnUnload();
+});
 
 // ─────────────────────────────────────────────────────────────────────
 // 헬스체크 · 초기화
@@ -1055,13 +1603,14 @@ document.querySelectorAll("#envToggle .mode").forEach((el) =>
   el.classList.toggle("on", el.dataset.preset === S.preset));
 document.querySelectorAll("#modeToggle .mode").forEach((el) =>
   el.classList.toggle("on", el.dataset.mode === S.mode));
+try { $("rvSpeed").value = localStorage.getItem("kstt_rv_speed") || "0.8"; } catch (_) { $("rvSpeed").value = "0.8"; }
 pollHealth();
 loadGlossary();
 loadHistory();
 
 // 스페이스바로 재생/정지 (편집 중이 아닐 때만)
 document.addEventListener("keydown", (e) => {
-  if (e.code !== "Space") return;
+  if (e.code !== "Space" || reviewOpen()) return;   // 교정 모드는 자체 단축키를 쓴다
   const t = e.target;
   if (t.isContentEditable || t.tagName === "TEXTAREA" || t.tagName === "INPUT") return;
   e.preventDefault();
