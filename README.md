@@ -3,9 +3,28 @@
 브라우저에서 녹음하거나 파일을 올리면 **내 PC에서** 한국어 텍스트로 변환합니다.
 외부 API를 일절 호출하지 않으므로 **비용 $0**, 음성이 외부로 나가지 않습니다.
 
-설계 근거와 파라미터 선택 이유는 [DESIGN.md](DESIGN.md) 참고.
+설계 근거와 파라미터 선택 이유는 [DESIGN.md](DESIGN.md), 개발 과정은 [DEVELOPMENT.md](DEVELOPMENT.md) 참고.
 
 ---
+
+## 처음 한 번: 설치
+
+```
+setup.bat
+```
+
+더블클릭하면 아래를 알아서 합니다. 인터넷이 필요하고, 처음에는 5~10분 걸립니다.
+
+1. Python 3.12, ffmpeg가 없으면 winget으로 설치
+2. 가상환경 생성 + 패키지 설치
+3. 음성 모델(약 1GB) 다운로드
+
+> 실행할 때 "Windows의 PC 보호" 창이 뜨면 **추가 정보 → 실행** 을 누르세요.
+> 도중에 실패하면 메시지를 확인하고 `setup.bat` 을 다시 실행하면 됩니다. 이미 된 단계는 건너뜁니다.
+> 필요 사양: Windows 10/11, 메모리 4GB 이상, 디스크 여유 2GB 이상 (강의실 모드까지 쓰면 5GB).
+
+**Mac** 은 `setup.command` → `start.command` 를 더블클릭합니다. Python·ffmpeg는 Homebrew로 설치합니다.
+Gatekeeper 경고가 뜨면 우클릭 → 열기. 자세한 건 `실행방법.txt` 의 "Mac에서 쓰기" 참고.
 
 ## 실행
 
@@ -21,7 +40,7 @@ start.bat
 ### 터미널에서 직접 실행하고 싶다면
 
 ```powershell
-cd "C:\Users\jung3\OneDrive\문서\claude_workspace1\korean-stt"
+cd <korean-stt 폴더>
 & "$env:USERPROFILE\korean-stt-runtime\.venv\Scripts\python.exe" -m uvicorn server.main:app --port 8000
 ```
 
@@ -214,14 +233,14 @@ CPU 추론이라 클럭에 그대로 비례해서, **꽂기만 해도 거의 2�
 
 ## 파일이 어디에 저장되나
 
-코드와 데이터를 분리했습니다. **모델(1.6GB)과 녹음 파일이 OneDrive에 동기화되지 않도록** 하기 위해서입니다.
+코드와 데이터를 분리했습니다. **모델(1~4GB)과 녹음 파일이 OneDrive 같은 동기화 폴더에 들어가지 않도록** 하기 위해서입니다.
 
 ```
-코드   C:\Users\jung3\OneDrive\문서\claude_workspace1\korean-stt\
-데이터 C:\Users\jung3\korean-stt-runtime\          ← OneDrive 밖
+코드   korean-stt\                        ← 압축을 푼 폴더 (어디든 상관없음)
+데이터 %USERPROFILE%\korean-stt-runtime\  ← setup.bat 이 만듦
         ├── .venv\              파이썬 가상환경
         └── data\
-            ├── models\         Whisper 모델 (1.6GB)
+            ├── models\         Whisper 모델 (1~4GB)
             ├── uploads\        업로드/녹음 원본
             ├── eval\           정확도 평가셋
             ├── glossary.json   용어집·치환사전
@@ -246,7 +265,7 @@ CPU 추론이라 클럭에 그대로 비례해서, **꽂기만 해도 거의 2�
    표기가 섞이면 모델이 맞게 들었어도 틀린 걸로 셉니다.
 2. 실행:
    ```powershell
-   cd "C:\Users\jung3\OneDrive\문서\claude_workspace1\korean-stt"
+   cd <korean-stt 폴더>
    & "$env:USERPROFILE\korean-stt-runtime\.venv\Scripts\python.exe" -X utf8 -m scripts.benchmark
    ```
 3. 모델별 CER(문자 오류율)과 속도가 표로 나옵니다.
@@ -273,10 +292,7 @@ CPU 추론이라 클럭에 그대로 비례해서, **꽂기만 해도 거의 2�
 
 ### 다시 설치해야 할 때
 
-```powershell
-py -3.12 -m venv "$env:USERPROFILE\korean-stt-runtime\.venv"
-& "$env:USERPROFILE\korean-stt-runtime\.venv\Scripts\python.exe" -m pip install -r server\requirements.txt
-```
+`setup.bat` 을 다시 실행하세요. 가상환경이 망가졌다면 `%USERPROFILE%\korean-stt-runtime\.venv` 폴더를 지운 뒤 실행하면 새로 만듭니다.
 
 ---
 
